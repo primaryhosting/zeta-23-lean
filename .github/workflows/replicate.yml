@@ -1,0 +1,40 @@
+name: Independent replication (Riemann Labs)
+on:
+  workflow_dispatch:
+  push:
+    branches: [replication]
+jobs:
+  build-and-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+      - name: Toolchain (from lean-toolchain pin)
+        run: |
+          cat lean-toolchain
+          elan toolchain install "$(cat lean-toolchain)"
+      - name: Mathlib cache
+        run: ~/.elan/bin/lake exe cache get || echo "cache get failed; building from source"
+      - name: Build Zeta23 (headline modules)
+        run: ~/.elan/bin/lake build
+      - name: Build Solution targets
+        run: |
+          ~/.elan/bin/lake build Solution
+          ~/.elan/bin/lake build Solution.Multiplicity
+          ~/.elan/bin/lake build Solution.XiPrime || true
+      - name: Axiom audit (comparator PrintAxioms)
+        run: |
+          ~/.elan/bin/lake env lean comparator/PrintAxioms.lean | tee axioms-report.txt
+          for f in comparator/PrintAxioms/*.lean; do ~/.elan/bin/lake env lean "$f" | tee -a axioms-report.txt; done
+          echo "--- assert: every line is exactly the 3 standard axioms, none else"
+          ! grep -vE "\[propext, Classical\.choice, Quot\.sound\]|^'" axioms-report.txt | grep -q "axiom" || (echo "UNEXPECTED AXIOM FOUND" && exit 1)
+          ! grep -q "sorryAx" axioms-report.txt || (echo "sorryAx FOUND" && exit 1)
+      - name: Upload audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: axioms-report
+          path: axioms-report.txt
