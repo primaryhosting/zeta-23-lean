@@ -38,3 +38,82 @@ jobs:
         with:
           name: axioms-report
           path: axioms-report.txt
+
+  # ---- FULL leanprover/comparator: statement-equality vs the trusted Challenge files
+  #      + Lean-kernel replay [+ independent nanoda kernel when it builds] ----
+  # Separate job on a FRESH checkout that never pre-builds Solution (comparator hygiene,
+  # README Assumption-2). Matrix-split one config per job to stay under the 6h cap.
+  # A red result here does NOT invalidate build-and-audit; it means the independent
+  # statement-equality/kernel-replay leg has not yet gone green.
+  comparator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg: [config, config-multiplicity, config-xiprime]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+      - name: Toolchain (from lean-toolchain pin)
+        run: elan toolchain install "$(cat lean-toolchain)"
+      - name: Mathlib cache
+        run: ~/.elan/bin/lake exe cache get || echo "cache get failed; building from source"
+      - name: Set up Go 1.24 (landrun build requirement)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build landrun (Landlock sandbox; no userns needed)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          git clone --depth 1 https://github.com/Zouuup/landrun "$RUNNER_TEMP/landrun"
+          ( cd "$RUNNER_TEMP/landrun" && go build -o "$RUNNER_TEMP/bin/landrun" ./cmd/landrun )
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build lean4export matched to this project's toolchain
+        run: |
+          set -euo pipefail
+          TC="$(cat lean-toolchain)"
+          git clone --depth 1 https://github.com/leanprover/lean4export "$RUNNER_TEMP/lean4export"
+          cd "$RUNNER_TEMP/lean4export"
+          echo "$TC" > lean-toolchain
+          ~/.elan/bin/lake build
+          echo "$RUNNER_TEMP/lean4export/.lake/build/bin" >> "$GITHUB_PATH"
+      - name: Build comparator
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/leanprover/comparator "$RUNNER_TEMP/comparator"
+          cd "$RUNNER_TEMP/comparator"
+          ~/.elan/bin/lake build lean4export comparator
+          echo "COMPARATOR_BIN=$RUNNER_TEMP/comparator/.lake/build/bin/comparator" >> "$GITHUB_ENV"
+      - name: Build nanoda independent kernel (best-effort second kernel)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ammkrn/nanoda_lib "$RUNNER_TEMP/nanoda"
+          cd "$RUNNER_TEMP/nanoda"
+          cargo build --release
+          test -x target/release/nanoda_bin && echo "NANODA_OK=1" >> "$GITHUB_ENV"
+      - name: Run comparator (${{ matrix.cfg }})
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cmp-logs"
+          CFG="comparator/${{ matrix.cfg }}.json"
+          if [ "${NANODA_OK:-0}" != "1" ]; then
+            CFG="$RUNNER_TEMP/${{ matrix.cfg }}.no-nanoda.json"
+            sed 's/"enable_nanoda": *true/"enable_nanoda": false/' "comparator/${{ matrix.cfg }}.json" > "$CFG"
+            echo "::warning::nanoda unavailable — Lean builtin kernel replay only for ${{ matrix.cfg }} (NOT independent-second-kernel)"
+          fi
+          echo "=== comparator $CFG (nanoda=${NANODA_OK:-0}) ==="
+          ~/.elan/bin/lake env "$COMPARATOR_BIN" "$CFG" 2>&1 | tee "$RUNNER_TEMP/cmp-logs/${{ matrix.cfg }}.log"
+          grep -q "Your solution is okay!" "$RUNNER_TEMP/cmp-logs/${{ matrix.cfg }}.log" \
+            || { echo "::error::comparator did NOT print success for ${{ matrix.cfg }}"; exit 1; }
+      - name: Upload comparator log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparator-${{ matrix.cfg }}
+          path: ${{ runner.temp }}/cmp-logs
